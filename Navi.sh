@@ -1,9 +1,17 @@
 #!/bin/bash
 
+# Function to check that required tools are installed and mapped
+check_tools(){
+    # Check if tools are installed
+    if ! command -v xterm &> /dev/null ; then echo -e "\e[31m[+] ERROR: xterm not found. run 'apt install xterm'\e[0m"; exit 1; fi
+    if ! command -v gowitness &> /dev/null ; then echo -e "\e[31m[+] - gowitness not found. run 'apt install -y gowitness'\e[0m"; exit 1; fi
+    if ! command -v netexec &> /dev/null ; then echo -e "\e[31m[+] - netexec not found. Install netexec\e[0m"; exit 1; fi
+}
+
 # Function to create folder structure
 create_folder_structure() {
     echo "Checking folder structure..."
-    local folder_structure=("scans/nmap/" "scans/masscan" "scans/parsed/port-lists" "scans/parsed/port-files" "web/gowitness" "targets" "logs")
+    local folder_structure=("scans/nmap/" "scans/masscan" "scans/parsed/port-lists" "scans/parsed/port-files" "web/gowitness/screenshots" "targets" "logs")
     local folders_exist=true
 
     for folder in "${folder_structure[@]}"; do
@@ -186,6 +194,102 @@ parse_scans() {
     echo -e "$(get_time): Finished Target Parsing" >> $log_file
 }
 
+# Function to kick off gowitness
+run_gowitness(){
+    echo -e "$(get_time): Starting GoWitness" >> $log_file
+    
+    gowitness nmap -f $nmapDirectory/*.xml --open --service-contains http --db-location sqlite://$gowitnessDatabase --screenshot-path "$gowitnessScreenshotsDirectory/"
+    
+    echo -e "$(get_time): Finished GoWitness" >> $log_file
+}
+
+# Function to parse out the gowitness results
+format_gowitness_results(){
+    # Multiple rows per name
+    sqlite3 -header -csv "$gowitnessDatabase" "
+    WITH server_headers AS (
+	SELECT url_id, value AS server
+	FROM headers
+	WHERE key = 'Server'
+    )
+    SELECT urls.url, urls.final_url, urls.response_code, urls.response_reason, urls.proto, 
+	   urls.content_length, urls.title, urls.filename, urls.is_pdf, 
+	   COALESCE(tls_certificate_dns_names.name, '') AS name,
+	   COALESCE(server_headers.server, '') AS server
+    FROM urls
+    LEFT JOIN tls ON urls.id = tls.url_id
+    LEFT JOIN tls_certificates ON tls.id = tls_certificates.tls_id
+    LEFT JOIN tls_certificate_dns_names ON tls_certificates.id = tls_certificate_dns_names.tls_certificate_id
+    LEFT JOIN server_headers ON urls.id = server_headers.url_id
+    ORDER BY urls.response_code;" > $gowitnessDirectory/gowitness-output-1-multiple-rows-per-name.csv
+
+    # Multiple names in one cell
+    sqlite3 -header -csv "$gowitnessDatabase" "
+    WITH headers_cte AS (
+	SELECT url_id,
+	    MAX(CASE WHEN key = 'Expires' THEN value END) AS expires,
+	    MAX(CASE WHEN key = 'Last-Modified' THEN value END) AS last_modified,
+	    MAX(CASE WHEN key = 'Server' THEN value END) AS server,
+	    MAX(CASE WHEN key = 'Content-Type' THEN value END) AS content_type,
+	    MAX(CASE WHEN key = 'Content-Length' THEN value END) AS content_length_header
+	FROM headers
+	GROUP BY url_id
+    ),
+    names_aggregated AS (
+	SELECT tls_certificates.tls_id AS url_id,
+	    GROUP_CONCAT(tls_certificate_dns_names.name, ', ') AS certificate_names
+	FROM tls_certificates
+	LEFT JOIN tls_certificate_dns_names ON tls_certificates.id = tls_certificate_dns_names.tls_certificate_id
+	GROUP BY tls_certificates.tls_id
+    )
+    SELECT u.url, u.final_url, u.response_code, u.response_reason, u.proto, 
+        u.content_length, u.title, u.filename, u.is_pdf, 
+	COALESCE(na.certificate_names, '') AS certificate_names,
+	hc.expires, hc.last_modified, hc.server, hc.content_type, hc.content_length_header
+    FROM urls u
+    LEFT JOIN tls t ON u.id = t.url_id
+    LEFT JOIN names_aggregated na ON t.id = na.url_id
+    LEFT JOIN headers_cte hc ON u.id = hc.url_id
+    ORDER BY u.response_code;" > $gowitnessDirectory/gowitness-output-2-combined-names.csv
+
+    # sqlite3 -header -csv gowitness.sqlite3 "SELECT subject_common_name FROM tls_certificates"
+    # sqlite3 -header -csv gowitness.sqlite3 "SELECT name FROM tls_certificate_dns_names"
+    sqlite3 -csv $gowitnessDatabase "
+    SELECT subject_common_name AS name
+    FROM tls_certificates
+    WHERE subject_common_name NOT LIKE '% %'
+    UNION
+    SELECT name
+    FROM tls_certificate_dns_names
+    WHERE name NOT LIKE '% %'
+    ORDER BY name COLLATE NOCASE;" > $gowitnessDirectory/gowitness-output-3-fqdns-and-names.txt
+
+    sqlite3 -header -csv "$gowitnessDatabase" "
+    SELECT urls.url,
+        COALESCE(tls_certificate_dns_names.name, '') AS name
+    FROM urls
+    LEFT JOIN tls ON urls.id = tls.url_id
+    LEFT JOIN tls_certificates ON tls.id = tls_certificates.tls_id
+    LEFT JOIN tls_certificate_dns_names ON tls_certificates.id = tls_certificate_dns_names.tls_certificate_id;" > $gowitnessDirectory/gowitness-output-4-urls-and-names.csv
+    cat $gowitnessDirectory/gowitness-output-4-urls-and-names.csv | sed 's/http.*:\/\///g' | awk -F'[:,]' '{print $1 "," $3}' | sort -Vu | grep -v \"\" | grep -v "url," > $gowitnessDirectory/gowitness-output-4-urls-and-names.csv 
+
+    # Sort the screenshots
+    sqlite3 -separator ' ' -list $gowitnessDatabase "SELECT response_code, filename FROM urls;" | while read -r response_code filename; do
+
+	# Create destination directory based on response_code
+	dest_path="$gowitnessScreenshotsDirectory/$response_code/"
+	mkdir -p "$dest_path"
+
+	# Move file to destination directory
+	source_path="$gowitnessScreenshotsDirectory/$filename"
+	if [ -f "$source_path" ]; then
+	    cp "$source_path" "$dest_path"
+	else
+	    echo "File not found: $source_path"
+	fi
+    done
+}
+
 # Function to handle exits
 cleanup() {
     wait
@@ -201,7 +305,7 @@ cleanup_sigint() {
 
 # Function to get the time for logs
 get_time() {
-    echo $(date +%m-%d-%Y %H:%M.%S %p %Z)
+    echo $(date +'%m-%d-%Y %I:%M:%S %p %Z')
 }
 
 # Main script execution
@@ -237,13 +341,23 @@ while getopts ":i:e:" opt; do
     esac
 done
 
-## Stage Logging
+## Global Variables - code needs refactoring to bring more paths here.
 start_time=$(date +%m-%d-%Y_%H%M)
 log_file=logs/${start_time}.log
+scanDirectory=scans
+webDirectory=web
+nmapDirectory="$scanDirectory/nmap"
+masscanDirectory="$scanDirectory/masscan"
+gowitnessDirectory="$webDirectory/gowitness"
+gowitnessDatabase="$gowitnessDirectory/gowitness.sqlite3"
+gowitnessScreenshotsDirectory="$gowitnessDirectory/screenshots"
 
+check_tools
 create_folder_structure
 run_target_gen "$targets_file" "$exclude_file"
 run_discovery_scan
 run_full_tcp_scan
 run_top_100_udp_scan
 parse_scans
+run_gowitness
+format_gowitness_results

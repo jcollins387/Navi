@@ -205,6 +205,8 @@ run_gowitness(){
 
 # Function to parse out the gowitness results
 format_gowitness_results(){
+    echo -e "$(get_time): Starting GoWitness Parsing" >> $log_file
+    
     # Multiple rows per name
     sqlite3 -header -csv "$gowitnessDatabase" "
     WITH server_headers AS (
@@ -288,6 +290,7 @@ format_gowitness_results(){
 	    echo "File not found: $source_path"
 	fi
     done
+    echo -e "$(get_time): Finished GoWitness Parsing" >> $log_file
 }
 
 # Function to handle exits

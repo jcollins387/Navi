@@ -3,15 +3,17 @@
 # Function to check that required tools are installed and mapped
 check_tools(){
     # Check if tools are installed
-    if ! command -v xterm &> /dev/null ; then echo -e "\e[31m[+] ERROR: xterm not found. run 'apt install xterm'\e[0m"; exit 1; fi
-    if ! command -v gowitness &> /dev/null ; then echo -e "\e[31m[+] - gowitness not found. run 'apt install -y gowitness'\e[0m"; exit 1; fi
+    if ! command -v xterm &> /dev/null ; then echo -e "\e[31m[+] ERROR: xterm not found. Run 'apt install xterm'\e[0m"; exit 1; fi
+    if ! command -v gowitness &> /dev/null ; then echo -e "\e[31m[+] - gowitness not found. Run 'apt install -y gowitness'\e[0m"; exit 1; fi
     if ! command -v netexec &> /dev/null ; then echo -e "\e[31m[+] - netexec not found. Install netexec\e[0m"; exit 1; fi
+    if ! command -v nuclei &> /dev/null ; then echo -e "\e[31m[+] - nuclei not found. Run 'apt install -y nuclei'\e[0m"; exit 1; fi
+    if ! command -v jq &> /dev/null ; then echo -e "\e[31m[+] - jq not found. Run 'apt install -y jq'\e[0m"; exit 1; fi
 }
 
 # Function to create folder structure
 create_folder_structure() {
     echo "Checking folder structure..."
-    local folder_structure=("scans/nmap/" "scans/masscan" "scans/parsed/port-lists" "scans/parsed/port-files" "web/gowitness/screenshots" "targets" "logs")
+    local folder_structure=("scans/nmap/" "scans/masscan" "scans/parsed/port-lists" "scans/parsed/port-files" "scans/nuclei/vulns" "web/gowitness/screenshots" "web/gowitness/reports" "targets" "logs" "vulnerabilities")
     local folders_exist=true
 
     for folder in "${folder_structure[@]}"; do
@@ -62,16 +64,16 @@ run_target_gen() {
     fi
 
     if [ -n "$exclude_file" ]; then
-	    nmap -iL $targets_file -sL -n --excludefile $exclude_file 2> targets/errors.txt |  grep report |  awk '{print $5}' > targets/targets_all.txt
+	    nmap -iL $targets_file -sL -n --excludefile $exclude_file 2> $targetDirectory/errors.txt |  grep report |  awk '{print $5}' > $targetDirectory/targets_all.txt
     else
-	    nmap -iL $targets_file -sL -n 2> targets/errors.txt | grep report | awk '{print $5}' > targets/targets_all.txt
+	    nmap -iL $targets_file -sL -n 2> $targetDirectory/errors.txt | grep report | awk '{print $5}' > $targetDirectory/targets_all.txt
     fi
     
     # Logic to check if we were given an invalid IP
-    if [ -s targets/errors.txt ]; then
+    if [ -s $targetDirectory/errors.txt ]; then
         echo -e "\e[31m[+] ERROR: The input file provided has invalid or unresolvable hosts.\e[0m"
-        awk '{print $4}' targets/errors.txt | tr -d '"'
-        rm targets/errors.txt
+        awk '{print $4}' $targetDirectory/errors.txt | tr -d '"'
+        rm $targetDirectory/errors.txt
         read -p "Do you want to ignore these hosts and continue testing? (Y/n): " response
         case "$response" in
 	    [Yy]* )
@@ -87,7 +89,7 @@ run_target_gen() {
 		;;
 	esac
     else
-        rm targets/errors.txt
+        rm $targetDirectory/errors.txt
     fi
 
     # Logic to ensure that IPs are privite addresses and throw a warning if its now 
@@ -126,10 +128,10 @@ run_discovery_scan() {
     echo -e "$(get_time): Starting Discovery Scans" >> $log_file
 
     # This needs root - need to adjust or set sticky bit
-    sudo masscan --open -Pn -n -iL targets/targets_all.txt --top-ports 100 --rate 1500 -oG scans/masscan/discovery.gnmap
+    sudo masscan --open -Pn -n -iL $targetDirectory/targets_all.txt --top-ports 100 --rate 1500 -oG scans/masscan/discovery.gnmap
     echo -e "Discovery scans complete.\n"
     echo -e "Parsing discovery scans..."
-    grep -v ^# scans/masscan/discovery.gnmap | awk '{print $4}' | sort -u > targets/discovered_hosts.txt
+    grep -v ^# scans/masscan/discovery.gnmap | awk '{print $4}' | sort -u > $targetDirectory/discovered_hosts.txt
     living_host_count=$(cat targets/discovered_hosts.txt | wc | awk '{print $1}')
     echo -e "There are $living_host_count discovered hosts. The list is in targets folder.\n"
    
@@ -143,18 +145,18 @@ run_full_tcp_scan() {
     # This is also defined in the run_discovery_scan function and should be pulled out to a global variable
     living_host_count=$(cat targets/discovered_hosts.txt | wc | awk '{print $1}')
     if [[ $living_host_count -lt 2500 ]]; then
-        nmap -sT -sV -sC --open -p- -iL targets/discovered_hosts.txt -oA scans/nmap/full_tcp
-    	echo -e "TCP service and script scans complete.\n"
+        nmap -sT -sV -sC --open -v -p- -iL $targetDirectory/discovered_hosts.txt -oA scans/nmap/full_tcp
+    	echo -e "\nTCP service and script scans complete.\n"
     	echo -e "$(get_time): Finished TCP Scans" >> $log_file
     else
     	echo -e "\e[33m[+] WARNING: You have more than 2500 hosts. A top 1000 port scan will be performed before running a full scan in the background.\e[0m"
-    	nmap -sT -sV -sC --open -iL targets/discovered_hosts.txt -oA scans/nmap/top_1000_tcp
-    	echo -e "Service and script scans complete.\n"
+    	nmap -sT -sV -sC --open -v -iL $targetDirectory/discovered_hosts.txt -oA scans/nmap/top_1000_tcp
+    	echo -e "\nService and script scans complete.\n"
     	echo -e "$(get_time): Finished TCP Quick Scan" >> $log_file
     	echo -e "$(get_time): Starting TCP Full Scan" >> $log_file
         echo -e "Opening xterm and performing a full TCP scan in the background.\n"
         ## Logic needs check here - can't use defined variables since xterm won't know them. Have it writing to all log files which could dirty things.
-        $(xterm -e 'nmap -sT -sV -sC --open -p- -iL targets/discovered_hosts.txt -oA scans/nmap/full'; echo -e "$(date +%m-%d-%Y_%H:%M.%S_%p_%Z): Finished TCP Full Scan" >> logs/*.log) &
+        $(xterm -e 'nmap -sT -sV -sC -v --open -p- -iL targets/discovered_hosts.txt -oA scans/nmap/full'; echo -e "$(date +%m-%d-%Y_%H:%M.%S_%p_%Z): Finished TCP Full Scan" >> logs/*.log) &
     fi 
 }
 
@@ -163,7 +165,7 @@ run_top_100_udp_scan() {
     echo -e "$(get_time): Starting UDP Scans" >> $log_file
 
     # Needs sudo here as well
-    sudo nmap -sU -F --open -iL targets/discovered_hosts.txt -oA scans/nmap/top_100_udp
+    sudo nmap -sU -F -v --open -iL $targetDirectory/discovered_hosts.txt -oA scans/nmap/top_100_udp
     echo -e "\nUDP scans complete.\n"
     
     echo -e "$(get_time): Finished UDP Scans" >> $log_file
@@ -180,14 +182,14 @@ parse_scans() {
     # Build UDP Port List
     cat scans/nmap/*.gnmap | grep "Ports:"|sed -e 's/^.*Ports: //g' -e 's;/, ;\n;g'|awk '!/tcp|filtered/'|cut -d"/" -f 1|sort -n -u > scans/parsed/port-lists/UDP-Ports-List.txt
     # Build TCP Port Files
-    echo -e "Building TCP Port Files...\n"
+    echo -e "Building TCP port files..."
     while read i; do
-        cat scans/nmap/*gnmap | grep "$i/open/tcp" | sed -e 's/Host: //g' -e 's/ (.*//g'| ${ipsorter} > scans/parsed/port-files/TCP-$i.txt
+        cat scans/nmap/*gnmap | grep "$i/open/tcp" | sed -e 's/Host: //g' -e 's/ (.*//g'| ${ipsorter} > scans/parsed/port-files/$i-TCP.txt
     done < scans/parsed/port-lists/TCP-Ports-List.txt
     # Build UDP Port Files
-    echo -e "Building UDP Port Files...\n"
+    echo -e "Building UDP port files..."
     while read i; do
-        cat scans/nmap/*gnmap | grep "$i/open/udp" | sed -e 's/Host: //g' -e 's/ (.*//g'| ${ipsorter} > scans/parsed/port-files/UDP-$i.txt
+        cat scans/nmap/*gnmap | grep "$i/open/udp" | sed -e 's/Host: //g' -e 's/ (.*//g'| ${ipsorter} > scans/parsed/port-files/$i-UDP.txt
     done < scans/parsed/port-lists/UDP-Ports-List.txt
     echo -e "Nmap scans have been parsed and are stored in scans/parsed.\n"
     
@@ -197,8 +199,9 @@ parse_scans() {
 # Function to kick off gowitness
 run_gowitness(){
     echo -e "$(get_time): Starting GoWitness" >> $log_file
+    echo -e "Starting GoWitness...\n"
     
-    gowitness nmap -f $nmapDirectory/*.xml --open --service-contains http --db-location sqlite://$gowitnessDatabase --screenshot-path "$gowitnessScreenshotsDirectory/"
+    gowitness nmap -f $nmapDirectory/*.xml --open --service-contains http --db-location sqlite://$gowitnessDatabase --screenshot-path "$gowitnessScreenshotsDirectory/" 1>/dev/null
     
     echo -e "$(get_time): Finished GoWitness" >> $log_file
 }
@@ -206,6 +209,7 @@ run_gowitness(){
 # Function to parse out the gowitness results
 format_gowitness_results(){
     echo -e "$(get_time): Starting GoWitness Parsing" >> $log_file
+    echo -e "\nParsing GoWitness results..."
     
     # Multiple rows per name
     sqlite3 -header -csv "$gowitnessDatabase" "
@@ -223,7 +227,7 @@ format_gowitness_results(){
     LEFT JOIN tls_certificates ON tls.id = tls_certificates.tls_id
     LEFT JOIN tls_certificate_dns_names ON tls_certificates.id = tls_certificate_dns_names.tls_certificate_id
     LEFT JOIN server_headers ON urls.id = server_headers.url_id
-    ORDER BY urls.response_code;" > $gowitnessDirectory/gowitness-output-1-multiple-rows-per-name.csv
+    ORDER BY urls.response_code;" > $gowitnessReportDirectory/multiple-rows-per-name.csv
 
     # Multiple names in one cell
     sqlite3 -header -csv "$gowitnessDatabase" "
@@ -252,7 +256,7 @@ format_gowitness_results(){
     LEFT JOIN tls t ON u.id = t.url_id
     LEFT JOIN names_aggregated na ON t.id = na.url_id
     LEFT JOIN headers_cte hc ON u.id = hc.url_id
-    ORDER BY u.response_code;" > $gowitnessDirectory/gowitness-output-2-combined-names.csv
+    ORDER BY u.response_code;" > $gowitnessReportDirectory/combined-names.csv
 
     # sqlite3 -header -csv gowitness.sqlite3 "SELECT subject_common_name FROM tls_certificates"
     # sqlite3 -header -csv gowitness.sqlite3 "SELECT name FROM tls_certificate_dns_names"
@@ -264,7 +268,7 @@ format_gowitness_results(){
     SELECT name
     FROM tls_certificate_dns_names
     WHERE name NOT LIKE '% %'
-    ORDER BY name COLLATE NOCASE;" > $gowitnessDirectory/gowitness-output-3-fqdns-and-names.txt
+    ORDER BY name COLLATE NOCASE;" > $gowitnessReportDirectory/fqdns-and-names.txt
 
     sqlite3 -header -csv "$gowitnessDatabase" "
     SELECT urls.url,
@@ -272,8 +276,11 @@ format_gowitness_results(){
     FROM urls
     LEFT JOIN tls ON urls.id = tls.url_id
     LEFT JOIN tls_certificates ON tls.id = tls_certificates.tls_id
-    LEFT JOIN tls_certificate_dns_names ON tls_certificates.id = tls_certificate_dns_names.tls_certificate_id;" > $gowitnessDirectory/gowitness-output-4-urls-and-names.csv
-    cat $gowitnessDirectory/gowitness-output-4-urls-and-names.csv | sed 's/http.*:\/\///g' | awk -F'[:,]' '{print $1 "," $3}' | sort -Vu | grep -v \"\" | grep -v "url," > $gowitnessDirectory/gowitness-output-4-urls-and-names.csv 
+    LEFT JOIN tls_certificate_dns_names ON tls_certificates.id = tls_certificate_dns_names.tls_certificate_id;" > $gowitnessReportDirectory/urls-and-names.csv
+    cat $gowitnessReportDirectory/urls-and-names.csv | sed 's/http.*:\/\///g' | awk -F'[:,]' '{print $1 "," $3}' | sort -Vu | grep -v \"\" | grep -v "url," > $gowitnessReportDirectory/urls-and-names.csv 
+
+    # Extract just the http ports and ignore WinRM - stash these in the web folder
+    sqlite3 -separator ' ' -list $gowitnessDatabase "SELECT urls.url FROM urls;" | egrep -v '(5985|5986|47001)' > $targetDirectory/web_targets.txt
 
     # Sort the screenshots
     sqlite3 -separator ' ' -list $gowitnessDatabase "SELECT response_code, filename FROM urls;" | while read -r response_code filename; do
@@ -290,7 +297,62 @@ format_gowitness_results(){
 	    echo "File not found: $source_path"
 	fi
     done
+    
     echo -e "$(get_time): Finished GoWitness Parsing" >> $log_file
+    echo -e "Finished GoWitness parsing - the results are in the $gowitnessReportDirectory folder.\n"
+}
+
+# Function to run nuclei
+run_nuclei(){
+    echo -e "$(get_time): Starting Nuclei Scans" >> $log_file
+    echo -e "Starting Nuclei vulnerability scans..."
+    
+    nuclei -ut -silent
+    #################################################
+    #                Nuclei Options                 #
+    #################################################
+    # -silent: Suppress console output              #
+    # -nm: Suppress metadata console output         #
+    # -ni: Disable external integration server(s)   #
+    # -it default-login: Add default cred checks    #
+    # -dut: Disable unsigned templates              #
+    # -project: Use a project folder for requests   #
+    # -project-path: Path to the project folder     #
+    # -j: Use JSON format for results               #
+    # -o: Output file name                          #
+    #################################################      
+    nuclei -l $targetDirectory/web_targets.txt -silent -nm -ni -it default-login -fhr -dut -project -project-path $nucleiDirectory/project -j -o $nucleiVulnDirectory/raw_vulnerability_data.json 1>/dev/null
+
+    echo -e "$(get_time): Finished Nuclei Scans" >> $log_file
+    echo -e "Finished Nuclei scans.\n"
+}
+
+# Function to clean up nuclei output
+parse_nuclei(){
+    echo -e "$(get_time): Starting Nuclei Parsing" >> $log_file
+    echo -e "Parsing Nuclei scans..."
+    
+    cat $nucleiVulnDirectory/raw_vulnerability_data.json | jq -r '.info.severity + "," + .info.name + "," + .host' | sort -u > $nucleiVulnDirectory/unique_vulnerabilities.csv
+    
+    # Make a folder structure for RiskRating/FindingName in the Vulnerabilities folder
+    while read -r line; do
+        severity=$(echo $line | awk -F"," '{print $1}')
+        finding=$(echo $line | awk -F"," '{print $2}')
+        mkdir -p "$vulnDirectory/$severity/$finding"
+    done < $nucleiVulnDirectory/unique_vulnerabilities.csv
+    
+    # Loop through each of the new folders - for every subfolder name pull out the impacted IP:Port combos and add them to a file
+    find "$vulnDirectory" -maxdepth 1 -mindepth 1 -type d | while read -r dir; do
+        topDir=$(basename "$dir")
+        
+        find "$vulnDirectory/$topDir" -maxdepth 1 -mindepth 1 -type d | while read -r dir2; do
+            secondDir=$(basename "$dir2")
+            grep "$secondDir" $nucleiVulnDirectory/unique_vulnerabilities.csv | awk -F"," '{print $3}' > "$vulnDirectory/$topDir/$secondDir/hosts.txt"
+        done
+    done
+       
+    echo -e "Nuclei scans are parsed and the results are in the $vulnDirectory folder.\n"
+    echo -e "$(get_time): Finished Nuclei Parsing" >> $log_file
 }
 
 # Function to handle exits
@@ -349,9 +411,14 @@ start_time=$(date +%m-%d-%Y_%H%M)
 log_file=logs/${start_time}.log
 scanDirectory=scans
 webDirectory=web
+targetDirectory=targets
+vulnDirectory=vulnerabilities
+nucleiDirectory="$scanDirectory/nuclei"
+nucleiVulnDirectory="$nucleiDirectory/vulns"
 nmapDirectory="$scanDirectory/nmap"
 masscanDirectory="$scanDirectory/masscan"
 gowitnessDirectory="$webDirectory/gowitness"
+gowitnessReportDirectory="$gowitnessDirectory/reports"
 gowitnessDatabase="$gowitnessDirectory/gowitness.sqlite3"
 gowitnessScreenshotsDirectory="$gowitnessDirectory/screenshots"
 
@@ -364,3 +431,5 @@ run_top_100_udp_scan
 parse_scans
 run_gowitness
 format_gowitness_results
+run_nuclei
+parse_nuclei
